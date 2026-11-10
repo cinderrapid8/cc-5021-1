@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>虚拟运动示范动作重定向工作台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='14'%3E%E2%87%84%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="./styles.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "../node_modules/three/build/three.module.js",
+      "three/addons/": "../node_modules/three/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⇄</span>
+      <div>
+        <h1>动作重定向工作台</h1>
+        <p id="frame-summary">加载中…</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button id="btn-save" class="btn">保存配置</button>
+      <label class="btn file-btn">载入配置
+        <input type="file" id="file-load" accept="application/json" hidden />
+      </label>
+      <button id="btn-export-glb" class="btn primary">导出 GLB 动画</button>
+      <button id="btn-export-json" class="btn">导出 JSON</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="viewports">
+      <div class="viewport-card">
+        <div class="viewport-head">
+          <h2>源骨架 · <span id="src-name"></span></h2>
+          <span class="badge" id="src-frame-badge"></span>
+        </div>
+        <div class="viewport" id="src-view"></div>
+      </div>
+      <div class="viewport-card">
+        <div class="viewport-head">
+          <h2>目标角色（重定向结果）· <span id="tgt-name"></span></h2>
+          <span class="badge" id="tgt-frame-badge"></span>
+        </div>
+        <div class="viewport" id="tgt-view"></div>
+      </div>
+    </section>
+
+    <aside class="sidebar">
+      <div class="panel" id="panel-playback">
+        <h3>播放控制</h3>
+        <div class="row">
+          <button id="btn-play" class="btn primary">播放</button>
+          <button id="btn-reset" class="btn">回到起点</button>
+        </div>
+        <input type="range" id="scrub" min="0" max="1000" value="0" />
+        <div class="row between">
+          <label>速度
+            <input type="range" id="speed" min="0.1" max="2" step="0.1" value="1" />
+            <span id="speed-val">1.0×</span>
+          </label>
+          <label class="check"><input type="checkbox" id="loop" checked /> 循环</label>
+        </div>
+        <div class="row between">
+          <label class="check"><input type="checkbox" id="ghost" /> 叠加源参考（半透明）</label>
+        </div>
+        <p class="time-label">时间 <span id="time-val">0.00</span> s / <span id="duration-val">2.00</span> s</p>
+      </div>
+
+      <div class="panel" id="panel-policy">
+        <h3>缺失关节策略</h3>
+        <label class="radio"><input type="radio" name="policy" value="compensate" checked />
+          <strong>补偿（世界空间增量）</strong> — 缺失链的扭转由下游继承</label>
+        <label class="radio"><input type="radio" name="policy" value="skip" />
+          <strong>跳过（局部增量）</strong> — 无对应的目标关节冻结在自身静止姿态</label>
+        <label class="row between" style="margin-top:8px">根节点地面抬升 (m)
+          <input type="number" id="ground-offset" value="0" step="0.01" style="width:90px" />
+        </label>
+        <p class="hint">根缩放（骨盆高度比）：<span id="root-scale"></span></p>
+      </div>
+
+      <div class="panel" id="panel-mapping">
+        <h3>骨骼对应与静止偏差</h3>
+        <div class="legend">
+          <span><i class="dot mapped"></i>已映射</span>
+          <span><i class="dot unmapped"></i>目标独有</span>
+          <span><i class="dot skipped"></i>源被跳过</span>
+        </div>
+        <div class="table-wrap">
+          <table id="mapping-table">
+            <thead>
+              <tr><th>目标关节</th><th>源关节</th><th>朝向偏差°</th><th>骨向偏差°</th><th>骨长比</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="mapping-edit">
+          <select id="edit-target"></select>
+          <select id="edit-source"></select>
+          <button id="btn-apply-mapping" class="btn">应用映射</button>
+        </div>
+        <p class="hint" id="mapping-summary"></p>
+      </div>
+
+      <div class="panel" id="panel-validation">
+        <h3>量化验证</h3>
+        <button id="btn-run-checks" class="btn primary">运行验证套件</button>
+        <div id="check-results" class="checks">
+          <p class="hint">尚未运行。验证输出关节朝向、位置误差与不变量，而非观感。</p>
+        </div>
+      </div>
+
+      <div class="panel" id="panel-selection">
+        <h3>关节检查</h3>
+        <p class="hint" id="sel-hint">在表格或视口中选择关节以查看实时世界坐标与朝向。</p>
+        <div id="sel-detail" class="sel-detail"></div>
+      </div>
+    </aside>
+  </main>
+
+  <script type="module" src="./src/ui/app.js"></script>
+</body>
+</html>

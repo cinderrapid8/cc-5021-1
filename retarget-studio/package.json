@@ -1,0 +1,26 @@
+{
+  "name": "retarget-studio",
+  "version": "1.0.0",
+  "description": "虚拟运动示范动作重定向工作台：不同比例/坐标帧/层级骨架间的动画迁移、量化验证与可播放导出",
+  "type": "module",
+  "scripts": {
+    "serve": "node tools/serve.mjs",
+    "test": "node --test 'tests/**/*.test.js'",
+    "test:browser": "node tests/browser.smoke.mjs"
+  },
+  "keywords": [
+    "animation",
+    "retargeting",
+    "skeleton",
+    "quaternion",
+    "three.js"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "three": "^0.160.0"
+  },
+  "devDependencies": {
+    "puppeteer": "^22.15.0"
+  }
+}
