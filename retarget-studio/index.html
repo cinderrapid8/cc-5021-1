@@ -85,6 +85,66 @@
         <p class="hint">根缩放（骨盆高度比）：<span id="root-scale"></span></p>
       </div>
 
+      <div class="panel" id="panel-constraints">
+        <h3>关节限制与接触修正</h3>
+        <label class="check"><input type="checkbox" id="constraints-enabled" />
+          启用约束（活动范围 + 接触修正）</label>
+        <p class="hint">关闭时保持初版无约束重定向结果。设置按目标角色保存，不修改源动画。</p>
+        <div id="constraints-body" hidden>
+          <div class="row between">
+            <span class="hint">目标角色 <code id="constraints-target-name"></code></span>
+            <button id="btn-constraints-defaults" class="btn">恢复该角色默认</button>
+          </div>
+
+          <h4>关节活动范围（关节自身静止局部系，单位 °）</h4>
+          <div class="table-wrap">
+            <table id="limits-table">
+              <thead><tr><th>关节</th><th>轴</th><th>最小°</th><th>最大°</th><th></th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="constraint-add">
+            <select id="limit-joint"></select>
+            <select id="limit-axis">
+              <option value="1,0,0">X 轴</option>
+              <option value="0,1,0">Y 轴</option>
+              <option value="0,0,1">Z 轴</option>
+            </select>
+            <button id="btn-add-limit" class="btn">添加限制</button>
+          </div>
+
+          <h4>接触点（优先级大者后求解，冲突时占优）</h4>
+          <div class="table-wrap">
+            <table id="contacts-table">
+              <thead><tr><th>启用</th><th>ID / 末端</th><th>链（逗号分隔）</th><th>优先级</th><th>模式参数</th><th></th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="constraint-add">
+            <select id="contact-effector"></select>
+            <select id="contact-mode">
+              <option value="ground">地面接触</option>
+              <option value="point">指定目标点</option>
+            </select>
+            <button id="btn-add-contact" class="btn">添加接触点</button>
+          </div>
+
+          <h4>求解器（有限迭代 + 稳定停止）</h4>
+          <div class="solver-grid">
+            <label>最大迭代<input type="number" id="ik-maxiter" min="1" max="64" step="1" /></label>
+            <label>容差 (m)<input type="number" id="ik-tol" min="0" step="0.0005" /></label>
+            <label>单帧步长上限 (°)<input type="number" id="ik-maxstep" min="0" max="180" step="1" /></label>
+          </div>
+
+          <h4>当前帧约束状态</h4>
+          <div id="constraint-now" class="constraint-now"></div>
+
+          <h4>触发事件（点击定位到峰值帧）</h4>
+          <p class="hint" id="constraint-stats"></p>
+          <div id="constraint-events" class="constraint-events"></div>
+        </div>
+      </div>
+
       <div class="panel" id="panel-mapping">
         <h3>骨骼对应与静止偏差</h3>
         <div class="legend">

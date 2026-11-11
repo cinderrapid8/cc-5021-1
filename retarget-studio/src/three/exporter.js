@@ -93,9 +93,12 @@ export function exportGLB(tgtSkel, retarget) {
   });
 }
 
-// Self-describing JSON the workbench can reload without Three.js.
+// Self-describing JSON the workbench can reload without Three.js. The frames
+// are the ACTUAL corrected curves (post constraint pass); the constraint
+// block records what was applied so downstream tools can audit every trigger.
 export function exportJSON(tgtSkel, retarget) {
   const frame = tgtSkel.frame;
+  const rep = retarget.constraintReport;
   return {
     format: 'retarget-studio/clip',
     version: 1,
@@ -106,6 +109,22 @@ export function exportJSON(tgtSkel, retarget) {
     policy: retarget.policy,
     mapping: retarget.mapping,
     rootScale: retarget.rootScale,
+    constraints: rep ? {
+      settings: rep.settings,
+      stats: rep.stats,
+      warnings: rep.warnings,
+      // Per-frame triggers: limit clamps and contact residuals with priority.
+      events: rep.perFrame.flatMap((fr) => [
+        ...fr.limits.map((l) => ({
+          time: fr.time, type: 'limit', joint: l.joint, axisIndex: l.axisIndex,
+          excessRad: l.excessRad,
+        })),
+        ...fr.contacts.filter((c) => c.active && c.residual > 1e-3).map((c) => ({
+          time: fr.time, type: 'contact', id: c.id, priority: c.priority,
+          residual: c.residual, converged: c.converged,
+        })),
+      ]),
+    } : null,
     frames: retarget.frames.map((f) => ({
       time: f.time,
       rootPos: canonicalToAuthoredVec(frame, f.rootPos),

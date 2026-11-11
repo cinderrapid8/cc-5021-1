@@ -63,6 +63,8 @@ export class SkeletonViewer {
     this.jointMeshes = new Map();
     this.labelSprites = new Map();
     this._ghost = null;
+    this._markerGeo = new THREE.OctahedronGeometry(0.032);
+    this._markerPool = [];
     this._ro = new ResizeObserver(() => this.resize());
     this._ro.observe(container);
   }
@@ -176,6 +178,41 @@ export class SkeletonViewer {
     if (this._ghost) {
       this.rig.remove(this._ghost);
       this._ghost = null;
+    }
+  }
+
+  // Emissive highlight for joints with a constraint trigger on the current
+  // frame. emphasis: Map<jointName, hexColor>; joints not listed are cleared.
+  // This makes the offending joint itself visible — nothing is hidden behind
+  // limbs or camera moves.
+  setJointEmphasis(emphasis) {
+    for (const [name, mesh] of this.jointMeshes) {
+      const hex = emphasis?.get(name) || 0;
+      if ((mesh.userData.emphHex || 0) === hex) continue;
+      mesh.userData.emphHex = hex;
+      mesh.material.emissive.setHex(hex);
+      mesh.material.emissiveIntensity = hex ? 0.85 : 0;
+    }
+  }
+
+  // Contact target markers. markers: [{ position:[x,y,z], residual }]; the
+  // marker turns red while the effector cannot reach it (residual > 1 mm).
+  setMarkers(markers) {
+    while (this._markerPool.length < markers.length) {
+      const m = new THREE.Mesh(this._markerGeo, new THREE.MeshBasicMaterial({
+        color: 0xffd166, transparent: true, opacity: 0.9, depthTest: false,
+      }));
+      m.renderOrder = 10;
+      this.scene.add(m);
+      this._markerPool.push(m);
+    }
+    for (let i = 0; i < this._markerPool.length; i++) {
+      const m = this._markerPool[i];
+      const spec = markers[i];
+      if (!spec) { m.visible = false; continue; }
+      m.visible = true;
+      m.position.copy(toThreeV(spec.position));
+      m.material.color.setHex(spec.residual > 1e-3 ? 0xff6b6b : 0xffd166);
     }
   }
 

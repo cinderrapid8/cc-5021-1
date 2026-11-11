@@ -6,8 +6,12 @@ import { loadSkeleton, canonicalRestPose, fk } from './skeleton.js';
 import { toCanonicalQuat, toCanonicalVec, buildFrame } from './frame.js';
 import { retargetClip, analyzeMapping } from './retarget.js';
 import {
+  normalizeConstraintSettings, twistAbout, twistAngle, unwrapNear,
+  temporalSmoothness, effectorPositions,
+} from './constraints.js';
+import {
   qmul, qconj, qrot, qdist, qangle, axisAngle, qidentity,
-  vadd, vsub, vscale, vlen, vdist, vnorm, deg, qcanonical,
+  vadd, vsub, vscale, vlen, vdist, vnorm, vdot, deg, rad, qcanonical,
 } from './vecquat.js';
 
 const TOL = {
@@ -362,6 +366,378 @@ export function testNaiveNameCopyFails(srcRaw, tgtRaw, clip, mapping) {
   });
 }
 
+// 9. ROM limits: with constraints enabled, every limited joint extracts inside
+// its range on every frame (measured with the same ordered local-frame
+// decomposition the clamp uses), and bone lengths stay exact.
+export function testRomLimitsRespected(srcRaw, tgtRaw, clip, mapping, options = {}) {
+  return check('关节活动范围限制（逐帧无越限，骨长不变）', () => {
+    const settings = options.constraints;
+    if (!settings) {
+      return { pass: true, errors: { enabled: 0 }, note: '约束未启用（初版无约束模式），跳过' };
+    }
+    const norm = normalizeConstraintSettings(settings);
+    const info = analyzeMapping(srcRaw, tgtRaw, mapping);
+    const rt = retargetClip(srcRaw, tgtRaw, clip, mapping,
+      { policy: options.policy || 'compensate', constraints: settings });
+
+    let worstExcess = 0;
+    for (const f of rt.frames) {
+      for (const [joint, specs] of Object.entries(norm.limits)) {
+        if (!info.tgt.byName.has(joint)) continue;
+        worstExcess = Math.max(worstExcess, limitExcess(
+          info.tgtRest.localQuat.get(joint), f.localQuats.get(joint), specs));
+      }
+    }
+    let boneDrift = 0;
+    for (const f of rt.frames) {
+      for (const name of info.tgt.ordered) {
+        const j = info.tgt.byName.get(name);
+        if (j.parent === null) continue;
+        const len = vdist(f.pose.worldPos.get(j.parent), f.pose.worldPos.get(name));
+        boneDrift = Math.max(boneDrift, Math.abs(len - info.tgtRest.boneLength.get(name)));
+      }
+    }
+    const errors = {
+      maxLimitExcessRad: worstExcess,
+      maxBoneLenDriftMeter: boneDrift,
+      clampEvents: rt.constraintReport.stats.clampCount,
+    };
+    return {
+      pass: worstExcess < 1e-9 && boneDrift < TOL.boneLen,
+      errors,
+      note: `全片限制触发 ${errors.clampEvents} 次，全部箝回范围内`,
+    };
+  });
+}
+
+// Max amount (rad) by which `local` violates the ordered axis limits, using
+// the same rest-local decomposition as the clamp. Each axis angle is
+// unwrapped toward its interval midpoint before measuring (2pi ambiguity).
+function limitExcess(restLocal, local, specs) {
+  let remaining = qmul(qconj(restLocal), local);
+  let worst = 0;
+  for (const spec of specs) {
+    const twist = twistAbout(remaining, spec.axis);
+    const principal = twistAngle(twist, spec.axis);
+    const mid = (spec.min + spec.max) / 2;
+    const unwrapped = unwrapNear(principal, mid);
+    worst = Math.max(worst, spec.min - unwrapped, unwrapped - spec.max, 0);
+    remaining = qmul(qconj(twist), remaining);
+  }
+  return worst;
+}
+
+// 10. Periodic boundary: a joint rotating continuously through +/-180deg must
+// be clamped on the correct side of the circle — saturation at the limit, no
+// snap to the opposite branch, no truncation of the continuous curve.
+export function testPeriodicBoundaryUnwrap() {
+  return check('角度限制的周期边界（连续动作不被错误截断）', () => {
+    const frame = { up: 'py', forward: 'nz', handedness: 1, unitsPerMeter: 1 };
+    const skel = {
+      name: 'unwrap-chain', frame,
+      joints: [
+        { name: 'r', parent: null, offset: [0, 1, 0], rest: [0, 0, 0, 1] },
+        { name: 'j', parent: 'r', offset: [1, 0, 0], rest: [0, 0, 0, 1] },
+        { name: 'e', parent: 'j', offset: [1, 0, 0], rest: [0, 0, 0, 1] },
+      ],
+    };
+    const N = 40;
+    const frames = [];
+    for (let i = 0; i <= N; i++) {
+      const th = rad(150 + (60 * i) / N); // 150deg -> 210deg, crosses +/-180
+      frames.push({
+        time: (i / N) * 2,
+        rootPos: [0, 1, 0],
+        rootRot: [0, 0, 0, 1],
+        locals: { j: axisAngle([0, 0, 1], th) },
+      });
+    }
+    const clip = { name: 'unwrap', frame, duration: 2, loop: false, frames };
+    const mapping = { r: 'r', j: 'j', e: 'e' };
+    const settings = { limits: { j: [{ axis: [0, 0, 1], min: -170, max: 190 }] } };
+
+    const rtOff = retargetClip(skel, skel, clip, mapping, {});
+    const rtOn = retargetClip(skel, skel, clip, mapping, { constraints: settings });
+
+    // Unwrapped angle series of joint j about Z (start unwrapped at 150deg).
+    const series = (rt) => {
+      const out = [];
+      let prev = rad(150);
+      for (const f of rt.frames) {
+        const principal = twistAngle(f.localQuats.get('j'), [0, 0, 1]);
+        const unwrapped = unwrapNear(principal, prev);
+        out.push(unwrapped);
+        prev = unwrapped;
+      }
+      return out;
+    };
+    const off = series(rtOff);
+    const on = series(rtOn);
+
+    const maxStep = (s) => s.slice(1).reduce((m, v, i) => Math.max(m, Math.abs(v - s[i])), 0);
+    const tv = (s) => s.slice(1).reduce((a, v, i) => a + Math.abs(v - s[i]), 0);
+    const errors = {
+      // The raw motion itself must be continuous across the +/-180 boundary.
+      rawMaxStepDeg: deg(maxStep(off)),
+      rawMaxDeg: deg(Math.max(...off)),
+      // After clamping: still continuous (no 340deg snap), saturated at +190,
+      // and never teleported to the -170 branch.
+      clampedMaxStepDeg: deg(maxStep(on)),
+      clampedMaxDeg: deg(Math.max(...on)),
+      clampedFinalDeg: deg(on[on.length - 1]),
+      clampedSaturationErrorDeg: deg(Math.abs(on[on.length - 1] - rad(190))),
+      // Clamping is 1-Lipschitz on the angle curve: variation cannot grow.
+      rawTotalVariationDeg: deg(tv(off)),
+      clampedTotalVariationDeg: deg(tv(on)),
+    };
+    const pass =
+      errors.rawMaxStepDeg < 5 && // unwrap recovers 181deg from -179deg
+      errors.rawMaxDeg > 209 &&
+      errors.clampedMaxStepDeg < 5 &&
+      errors.clampedMaxDeg <= 190 + 1e-9 &&
+      errors.clampedSaturationErrorDeg < 1e-6 &&
+      on[on.length - 1] > rad(180) && // i.e. NOT snapped to -170
+      tv(on) <= tv(off) + 1e-9;
+    return { pass, errors };
+  });
+}
+
+// 11. Contact correction on the short-armed target: an overhead point beyond
+// reach must leave the arm fully extended toward it (nearest feasible pose,
+// residual reported), while a reachable point is hit exactly. Bone lengths
+// never change; iteration count stays under the cap.
+export function testContactReach(srcRaw, tgtRaw, mapping) {
+  return check('接触修正：短臂触及高点（不可达保留最近可行姿态）', () => {
+    const still = {
+      name: 'still', frame: srcRaw.frame, duration: 1, loop: false,
+      frames: [0, 0.5, 1].map((t) => ({
+        time: t, rootPos: [0, 100, 0], rootRot: [0, 0, 0, 1], locals: {},
+      })),
+    };
+    const info = analyzeMapping(srcRaw, tgtRaw, mapping);
+    const shoulder = info.tgtRest.worldPos.get('arm_L');
+    const reach = info.tgtRest.boneLength.get('elbow_L')
+      + info.tgtRest.boneLength.get('wrist_L')
+      + info.tgtRest.boneLength.get('hand_L');
+
+    const run = (target) => retargetClip(srcRaw, tgtRaw, still, mapping, {
+      constraints: {
+        contacts: [{
+          id: 'hand-goal', effector: 'hand_L',
+          chain: ['arm_L', 'elbow_L', 'wrist_L'],
+          priority: 5, mode: 'point', target,
+        }],
+        // Static 3-frame clip: the rate cap is disabled so the solver must
+        // reach full extension immediately (the cap is exercised in check 12).
+        ik: { maxIterations: 16, tolerance: 0.001, maxFrameStepDeg: 0 },
+      },
+    });
+    const boneDrift = (rt) => {
+      let d = 0;
+      for (const f of rt.frames) {
+        for (const name of info.tgt.ordered) {
+          const j = info.tgt.byName.get(name);
+          if (j.parent === null) continue;
+          const len = vdist(f.pose.worldPos.get(j.parent), f.pose.worldPos.get(name));
+          d = Math.max(d, Math.abs(len - info.tgtRest.boneLength.get(name)));
+        }
+      }
+      return d;
+    };
+
+    // Unreachable: 0.25 m beyond full extension, straight overhead.
+    const far = [shoulder[0], shoulder[1] + reach + 0.25, shoulder[2]];
+    const rtFar = run(far);
+    const repFar = rtFar.constraintReport.perFrame[2].contacts[0];
+    const handFar = rtFar.frames[2].pose.worldPos.get('hand_L');
+    const alignCos = vdot(
+      vnorm(vsub(handFar, shoulder)), vnorm(vsub(far, shoulder)));
+
+    // Reachable: well inside the workspace.
+    const near = [shoulder[0] + 0.2, shoulder[1] - 0.1, shoulder[2] - 0.1];
+    const rtNear = run(near);
+    const repNear = rtNear.constraintReport.perFrame[2].contacts[0];
+
+    const errors = {
+      unreachableResidualError: Math.abs(repFar.residual - 0.25),
+      unreachableAlignmentDeg: deg(Math.acos(Math.max(-1, Math.min(1, alignCos)))),
+      unreachableConverged: repFar.converged ? 1 : 0,
+      reachableResidual: repNear.residual,
+      reachableConverged: repNear.converged ? 1 : 0,
+      maxBoneLenDriftMeter: Math.max(boneDrift(rtFar), boneDrift(rtNear)),
+      maxIterations: Math.max(repFar.iterations, repNear.iterations),
+    };
+    const pass =
+      errors.unreachableResidualError < 5e-3 && // nearest feasible pose kept
+      errors.unreachableAlignmentDeg < 3 && // arm extended toward target
+      repFar.converged === false && // honestly reported as not converged
+      repFar.residual > 0.2 && // residual visible, not hidden
+      errors.reachableResidual < 1e-3 &&
+      repNear.converged === true &&
+      errors.maxBoneLenDriftMeter < TOL.boneLen &&
+      errors.maxIterations <= 16;
+    return {
+      pass, errors,
+      note: `不可达残差 ${repFar.residual.toFixed(3)}m（优先级 ${repFar.priority}），可达残差 ${repNear.residual.toExponential(1)}m`,
+    };
+  });
+}
+
+// 12. Continuous multi-frame contact: a pinned foot stays put while reachable,
+// residuals are reported with priorities when the root drags it out of reach,
+// hysteresis prevents state flicker, and correction keeps the motion smooth.
+// Also compares end-effector error and temporal smoothness before/after.
+export function testMultiFrameContact(srcRaw, tgtRaw, clip, mapping, options = {}) {
+  return check('连续多帧接触（钉扎稳定 / 残差与优先级 / 平滑性对比）', () => {
+    const info = analyzeMapping(srcRaw, tgtRaw, mapping);
+    // A. Synthetic gentle bob (+-8 cm at the source root), pinned ground
+    // contact. The pelvis periodically drags the foot out of reach.
+    const N = 40;
+    const frames = [];
+    for (let i = 0; i <= N; i++) {
+      const u = i / N;
+      frames.push({
+        time: (i / N) * 2,
+        rootPos: [0, 100 + 8 * Math.sin(2 * Math.PI * u), 0],
+        rootRot: [0, 0, 0, 1],
+        locals: {},
+      });
+    }
+    const bob = { name: 'bob', frame: srcRaw.frame, duration: 2, loop: false, frames };
+    const settings = {
+      contacts: [{
+        id: 'foot-pin', effector: 'ankle_L', chain: ['thigh_L', 'knee_L'],
+        priority: 10, mode: 'ground', groundY: 0.17, enter: 0.03, exit: 0.06,
+        pin: true,
+      }],
+      // Explicit rate cap: forced jumps (knee snapping straight at the reach
+      // boundary) are spread over frames at <= 12deg/frame.
+      ik: { maxIterations: 16, tolerance: 0.001, maxFrameStepDeg: 12 },
+    };
+    const rtOff = retargetClip(srcRaw, tgtRaw, bob, mapping, {});
+    const rtOn = retargetClip(srcRaw, tgtRaw, bob, mapping, { constraints: settings });
+    const rep = rtOn.constraintReport;
+
+    const contacts = rep.perFrame.map((f) => f.contacts[0]);
+    const activeFrames = contacts.filter((c) => c.active);
+    const inactiveFrames = contacts.filter((c) => !c.active);
+    const pinned = contacts.filter((c) => c.active && c.residual <= 2e-3);
+    const violated = contacts.filter((c) => c.active && c.residual > 5e-3);
+
+    // Pinned frames: the ankle really is at the pin target.
+    let pinDeviation = 0;
+    rep.perFrame.forEach((fr, i) => {
+      const c = fr.contacts[0];
+      if (c.active && c.residual <= 2e-3) {
+        pinDeviation = Math.max(pinDeviation,
+          vdist(rtOn.frames[i].pose.worldPos.get('ankle_L'), c.target));
+      }
+    });
+    // End-effector error before vs after correction (distance to the pin).
+    const offPos = effectorPositions(info.tgt, info.tgtRest, rtOff.frames, 'ankle_L');
+    let errBefore = 0;
+    let errAfter = 0;
+    let activeCount = 0;
+    rep.perFrame.forEach((fr, i) => {
+      const c = fr.contacts[0];
+      if (!c.active) return;
+      activeCount++;
+      errBefore += vdist(offPos[i], c.target);
+      errAfter += c.residual;
+    });
+    // Smoothness before vs after on the corrected chain.
+    const smoothOff = temporalSmoothness(rtOff.frames, ['thigh_L', 'knee_L']);
+    const smoothOn = temporalSmoothness(rtOn.frames, ['thigh_L', 'knee_L']);
+    // Bone lengths under correction.
+    let boneDrift = 0;
+    for (const f of rtOn.frames) {
+      for (const name of info.tgt.ordered) {
+        const j = info.tgt.byName.get(name);
+        if (j.parent === null) continue;
+        const len = vdist(f.pose.worldPos.get(j.parent), f.pose.worldPos.get(name));
+        boneDrift = Math.max(boneDrift, Math.abs(len - info.tgtRest.boneLength.get(name)));
+      }
+    }
+    const maxIter = rep.perFrame.reduce((m, fr) =>
+      Math.max(m, fr.contacts[0].iterations || 0), 0);
+
+    const errors = {
+      activations: rep.stats.contactActivations[0].activations,
+      inactiveFrames: inactiveFrames.length,
+      pinnedFrames: pinned.length,
+      violatedFrames: violated.length,
+      pinDeviationMeter: pinDeviation,
+      meanErrorBeforeMeter: errBefore / (activeCount || 1),
+      meanErrorAfterMeter: errAfter / (activeCount || 1),
+      // The uncorrected bob has NO joint rotation (TV=0), so a TV ratio is
+      // vacuous; the meaningful smoothness guarantee is the rate cap itself.
+      smoothnessBeforeTV: smoothOff.totalVariationRad,
+      smoothnessAfterTV: smoothOn.totalVariationRad,
+      smoothnessAfterMaxStep: smoothOn.maxStepRad,
+      rateLimitedFrames: rep.stats.rateLimited,
+      maxBoneLenDriftMeter: boneDrift,
+      maxIterations: maxIter,
+      priorityReported: violated.length ? violated[0].priority : -1,
+    };
+    const pass =
+      errors.activations >= 1 && errors.activations <= 4 && // hysteresis: no flicker
+      inactiveFrames.length > 0 && // contact releases and re-engages
+      pinned.length > 0 && pinDeviation <= 2e-3 && // pinned foot stays put
+      violated.length > 0 && // unreachable frames honestly reported
+      errors.priorityReported === 10 &&
+      errors.meanErrorAfterMeter < errors.meanErrorBeforeMeter &&
+      // Rate cap holds: no joint in the chain rotates more than 12deg/frame.
+      smoothOn.maxStepRad <= rad(12) + 1e-9 &&
+      boneDrift < TOL.boneLen &&
+      maxIter <= 16;
+    return {
+      pass, errors,
+      note: `钉扎 ${pinned.length} 帧、超限残差 ${violated.length} 帧（优先级 10）、末端误差 ${(errors.meanErrorBeforeMeter * 1000).toFixed(1)}mm→${(errors.meanErrorAfterMeter * 1000).toFixed(1)}mm、最大单帧步长 ${deg(smoothOn.maxStepRad).toFixed(1)}°`,
+    };
+  });
+}
+
+// 13. The unconstrained retarget remains selectable: constraints:null is
+// bit-identical to the baseline, enabling a binding limit changes the output,
+// and the source animation object is never mutated.
+export function testConstraintToggle(srcRaw, tgtRaw, clip, mapping) {
+  return check('约束开关（关闭=初版无约束结果，源动画零污染）', () => {
+    const before = JSON.stringify(clip);
+    const rtBase = retargetClip(srcRaw, tgtRaw, clip, mapping, { policy: 'compensate' });
+    const rtNull = retargetClip(srcRaw, tgtRaw, clip, mapping,
+      { policy: 'compensate', constraints: null });
+    const tgt = rtBase._info.tgt;
+    let disabledDiff = 0;
+    for (let k = 0; k < rtBase.frames.length; k++) {
+      for (const name of tgt.ordered) {
+        disabledDiff = Math.max(disabledDiff, qdist(
+          rtBase.frames[k].localQuats.get(name), rtNull.frames[k].localQuats.get(name)));
+      }
+      disabledDiff = Math.max(disabledDiff,
+        vdist(rtBase.frames[k].rootPos, rtNull.frames[k].rootPos));
+    }
+    const rtOn = retargetClip(srcRaw, tgtRaw, clip, mapping, {
+      policy: 'compensate',
+      constraints: { limits: { arm_L: [{ axis: [0, 1, 0], min: -10, max: 10 }] } },
+    });
+    let enabledChange = 0;
+    for (let k = 0; k < rtOn.frames.length; k++) {
+      enabledChange = Math.max(enabledChange, qdist(
+        rtOn.frames[k].localQuats.get('arm_L'), rtBase.frames[k].localQuats.get('arm_L')));
+    }
+    const errors = {
+      disabledVsBaselineRad: disabledDiff,
+      enabledMaxChangeRad: enabledChange,
+      sourceClipMutated: JSON.stringify(clip) === before ? 0 : 1,
+    };
+    return {
+      pass: disabledDiff < 1e-15 && enabledChange > 1e-6 && errors.sourceClipMutated === 0,
+      errors,
+      note: `关闭约束与初版结果逐位一致；启用后 arm_L 最大改变 ${deg(enabledChange).toFixed(1)}°`,
+    };
+  });
+}
+
 // Run the full browser/Node suite.
 export function runAllChecks(srcRaw, tgtRaw, clip, mapping, options = { policy: 'compensate' }) {
   const policy = options.policy || 'compensate';
@@ -374,5 +750,10 @@ export function runAllChecks(srcRaw, tgtRaw, clip, mapping, options = { policy: 
     testMissingJointPolicy(srcRaw, tgtRaw, clip, mapping),
     testConfigRoundtrip(srcRaw, tgtRaw, clip, mapping, options),
     testNaiveNameCopyFails(srcRaw, tgtRaw, clip, mapping),
+    testRomLimitsRespected(srcRaw, tgtRaw, clip, mapping, options),
+    testPeriodicBoundaryUnwrap(),
+    testContactReach(srcRaw, tgtRaw, mapping),
+    testMultiFrameContact(srcRaw, tgtRaw, clip, mapping, options),
+    testConstraintToggle(srcRaw, tgtRaw, clip, mapping),
   ];
 }

@@ -49,14 +49,16 @@ function poseAt(u) {
     ['R_wrist', qidentity()],
     ['R_hand', qidentity()],
 
-    // Stepping: opposed hip swing, knees flex at the lift phase.
+    // Stepping: opposed hip swing, knees flex at the lift phase. Knee flexion
+    // is a NEGATIVE X rotation: +X would swing the ankle forward (-Z), bending
+    // the knee backward past its anatomical range.
     ['L_hip', AX(-0.5 * s)],
-    ['L_knee', AX(0.8 * Math.max(0, s) * Math.max(0, s))],
+    ['L_knee', AX(-0.8 * Math.max(0, s) * Math.max(0, s))],
     ['L_ankle', AX(0.2 * s)],
     ['L_toe', qidentity()],
 
     ['R_hip', AX(0.5 * s)],
-    ['R_knee', AX(0.8 * Math.max(0, -s) * Math.max(0, -s))],
+    ['R_knee', AX(-0.8 * Math.max(0, -s) * Math.max(0, -s))],
     ['R_ankle', AX(-0.2 * s)],
     ['R_toe', qidentity()],
   ]);

@@ -4,10 +4,12 @@
 
 import { sourceSkeleton, targetSkeleton, defaultMapping } from '../data/skeletons.js';
 import { buildSourceClip } from '../data/clip.js';
+import { defaultConstraintsFor } from '../data/constraints.js';
 import { loadSkeleton, canonicalRestPose, fk } from '../engine/skeleton.js';
 import { retargetClip, sampleClip, analyzeMapping } from '../engine/retarget.js';
 import { describeFrame, toCanonicalVec, toCanonicalQuat } from '../engine/frame.js';
 import { runAllChecks } from '../engine/validation.js';
+import { aggregateEvents } from '../engine/constraints.js';
 import { defaultConfig, serializeConfig, parseConfig } from '../engine/config.js';
 import { qdist, vdist, deg, slerp } from '../engine/vecquat.js';
 import { SkeletonViewer } from '../three/viewer.js';
@@ -41,12 +43,37 @@ function statusMaps(info) {
   return { tgtStatus, srcStatus };
 }
 
+// Constraint settings for the CURRENT target skeleton, or null when disabled
+// (null == the initial unconstrained retarget, bit-identical).
+function activeConstraintSettings() {
+  const c = state.config.constraints;
+  if (!c?.enabled) return null;
+  return c.targets[state.tgt.name] || null;
+}
+
+// Fill defaults for the current target the first time constraints are used.
+function ensureTargetConstraints() {
+  const targets = state.config.constraints.targets;
+  if (!targets[state.tgt.name]) {
+    targets[state.tgt.name] = defaultConstraintsFor(state.tgt.name) || {
+      limits: {}, contacts: [],
+      ik: { maxIterations: 16, tolerance: 1e-3, minImprovement: 1e-6, maxFrameStepDeg: 12 },
+    };
+  }
+  return targets[state.tgt.name];
+}
+
 function rebuild() {
   const cfg = state.config;
   state.retarget = retargetClip(sourceSkeleton, targetSkeleton, state.srcClip,
-    cfg.mapping, { policy: cfg.policy, rootGroundOffset: cfg.rootGroundOffset });
+    cfg.mapping, {
+      policy: cfg.policy,
+      rootGroundOffset: cfg.rootGroundOffset,
+      constraints: activeConstraintSettings(),
+    });
   state.info = analyzeMapping(sourceSkeleton, targetSkeleton, cfg.mapping);
   renderMappingTable();
+  renderConstraints();
   $('root-scale').textContent = state.retarget.rootScale.toFixed(4);
   $('mapping-summary').textContent =
     `目标独有（无驱动）: ${state.info.unmappedTargets.join(', ') || '无'} · ` +
@@ -74,6 +101,7 @@ function updatePose() {
   } else {
     state.tgtViewer.clearGhost();
   }
+  updateConstraintNow();
   updateSelectionDetail(tgtSample, srcSample);
 }
 
@@ -207,11 +235,227 @@ function parentDist(name, sample) {
 const fmtV = (v) => `[${v.map((x) => x.toFixed(3)).join(', ')}]`;
 const fmtQ = (q) => `[${q.map((x) => x.toFixed(3)).join(', ')}]`;
 
+// ---- constraints panel ------------------------------------------------------
+
+function frameIndexAt(rt, t) {
+  const { frames, duration, loop } = rt;
+  let time = t;
+  if (loop) time = ((t % duration) + duration) % duration;
+  else time = Math.min(t, duration);
+  let i = 0;
+  while (i < frames.length - 2 && frames[i + 1].time <= time) i++;
+  return i;
+}
+
+function seekTo(t) {
+  state.time = t;
+  $('scrub').value = Math.round((t / state.retarget.duration) * 1000);
+  $('time-val').textContent = t.toFixed(2);
+}
+
+const AXIS_LABELS = ['X', 'Y', 'Z'];
+function axisLabel(axis) {
+  const i = axis.indexOf(Math.max(...axis.map(Math.abs)));
+  const sign = axis[i] < 0 ? '−' : '';
+  return `${sign}${AXIS_LABELS[i]} [${axis.map((x) => Number(x.toFixed(2))).join(',')}]`;
+}
+
+// Re-render the whole constraints panel from config + the latest report.
+function renderConstraints() {
+  const c = state.config.constraints;
+  const body = $('constraints-body');
+  $('constraints-enabled').checked = !!c.enabled;
+  body.hidden = !c.enabled;
+  if (!c.enabled) return;
+
+  const settings = state.config.constraints.targets[state.tgt.name];
+  $('constraints-target-name').textContent = state.tgt.name;
+  if (!settings) {
+    // Enabled but this target has no settings yet: the retarget ran
+    // unconstrained. Offer to materialize defaults.
+    $('limits-table').querySelector('tbody').innerHTML = '';
+    $('contacts-table').querySelector('tbody').innerHTML = '';
+    $('constraint-events').innerHTML =
+      '<p class="hint">该角色尚无约束设置，点击“恢复该角色默认”生成。</p>';
+    $('constraint-stats').textContent = '';
+    return;
+  }
+
+  // Limit rows.
+  const limitBody = $('limits-table').querySelector('tbody');
+  limitBody.innerHTML = '';
+  for (const joint of Object.keys(settings.limits)) {
+    settings.limits[joint].forEach((spec, ai) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${joint}</td>
+        <td>${axisLabel(spec.axis)}</td>
+        <td><input type="number" step="1" value="${spec.min}" data-j="${joint}" data-i="${ai}" data-k="min" /></td>
+        <td><input type="number" step="1" value="${spec.max}" data-j="${joint}" data-i="${ai}" data-k="max" /></td>
+        <td><button class="btn danger-mini" data-del-limit="${joint}|${ai}">删</button></td>`;
+      limitBody.appendChild(tr);
+    });
+  }
+  limitBody.querySelectorAll('input').forEach((inp) => {
+    inp.addEventListener('change', () => {
+      const spec = settings.limits[inp.dataset.j][Number(inp.dataset.i)];
+      spec[inp.dataset.k] = Number(inp.value) || 0;
+      rebuild();
+    });
+  });
+  limitBody.querySelectorAll('[data-del-limit]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const [joint, ai] = btn.dataset.delLimit.split('|');
+      settings.limits[joint].splice(Number(ai), 1);
+      if (!settings.limits[joint].length) delete settings.limits[joint];
+      rebuild();
+    });
+  });
+
+  // Contact rows.
+  const contactBody = $('contacts-table').querySelector('tbody');
+  contactBody.innerHTML = '';
+  settings.contacts.forEach((ct, ci) => {
+    const tr = document.createElement('tr');
+    const params = ct.mode === 'point'
+      ? `目标 <input type="text" class="ct-target" value="${(ct.target || [0, 0, 0]).join(',')}" />`
+      : `地面Y <input type="number" class="ct-ground" step="0.01" value="${ct.groundY}" />
+         <label class="check"><input type="checkbox" class="ct-pin" ${ct.pin !== false ? 'checked' : ''}/>钉扎</label>`;
+    tr.innerHTML = `
+      <td><input type="checkbox" class="ct-enabled" ${ct.enabled !== false ? 'checked' : ''} /></td>
+      <td><code>${ct.id}</code><br/><span class="hint">${ct.effector}</span></td>
+      <td><input type="text" class="chain-input ct-chain" value="${(ct.chain || []).join(',')}" /></td>
+      <td><input type="number" class="prio ct-prio" step="1" value="${ct.priority}" /></td>
+      <td class="ct-params">${params}</td>
+      <td><button class="btn danger-mini" data-del-contact="${ci}">删</button></td>`;
+    contactBody.appendChild(tr);
+    tr.querySelector('.ct-enabled').addEventListener('change', (e) => {
+      ct.enabled = e.target.checked; rebuild();
+    });
+    tr.querySelector('.ct-chain').addEventListener('change', (e) => {
+      ct.chain = e.target.value.split(',').map((s) => s.trim()).filter(Boolean);
+      rebuild();
+    });
+    tr.querySelector('.ct-prio').addEventListener('change', (e) => {
+      ct.priority = Number(e.target.value) || 0; rebuild();
+    });
+    tr.querySelector('.ct-ground')?.addEventListener('change', (e) => {
+      ct.groundY = Number(e.target.value) || 0; rebuild();
+    });
+    tr.querySelector('.ct-pin')?.addEventListener('change', (e) => {
+      ct.pin = e.target.checked; rebuild();
+    });
+    tr.querySelector('.ct-target')?.addEventListener('change', (e) => {
+      const v = e.target.value.split(',').map((s) => Number(s.trim()));
+      if (v.length === 3 && v.every(Number.isFinite)) { ct.target = v; rebuild(); }
+    });
+    tr.querySelector('[data-del-contact]').addEventListener('click', () => {
+      settings.contacts.splice(ci, 1); rebuild();
+    });
+  });
+
+  // IK solver inputs.
+  $('ik-maxiter').value = settings.ik?.maxIterations ?? 16;
+  $('ik-tol').value = settings.ik?.tolerance ?? 1e-3;
+  $('ik-maxstep').value = settings.ik?.maxFrameStepDeg ?? 0;
+
+  // Add-row selects.
+  $('limit-joint').innerHTML = state.tgt.ordered
+    .filter((n) => state.tgt.byName.get(n).parent !== null)
+    .map((n) => `<option value="${n}">${n}</option>`).join('');
+  $('contact-effector').innerHTML = $('limit-joint').innerHTML;
+
+  renderConstraintEvents();
+}
+
+function renderConstraintEvents() {
+  const host = $('constraint-events');
+  const rep = state.retarget?.constraintReport;
+  host.innerHTML = '';
+  if (!rep) {
+    $('constraint-stats').textContent = state.config.constraints.enabled
+      ? '该目标角色未配置约束，当前为无约束结果。' : '';
+    return;
+  }
+  const s = rep.stats;
+  const acts = s.contactActivations.map((a) => `${a.id}×${a.activations}`).join('，') || '无';
+  $('constraint-stats').textContent =
+    `限制触发 ${s.clampCount} 次 · 接触激活 ${acts} · 最大迭代 ${s.maxIterations} · 限速帧 ${s.rateLimited}`
+    + (rep.warnings.length ? ` ｜ 警告：${rep.warnings.join('；')}` : '');
+  for (const e of aggregateEvents(rep)) {
+    const div = document.createElement('div');
+    div.className = 'event-item';
+    const desc = e.type === 'limit'
+      ? `<span class="tag-limit">限制</span> ${e.joint} 轴${e.axisIndex} 峰值超出 ${deg(e.maxValue).toFixed(1)}°`
+      : `<span class="tag-contact">接触</span> ${e.id}（优先级 ${e.priority}）峰值残差 ${(e.maxValue * 1000).toFixed(1)}mm`;
+    div.innerHTML = `<span>${desc}</span><code>${e.t0.toFixed(2)}–${e.t1.toFixed(2)}s · ${e.frames}帧</code>`;
+    div.title = '点击定位到峰值帧';
+    div.addEventListener('click', () => seekTo(e.tPeak));
+    host.appendChild(div);
+  }
+  if (!host.children.length) host.innerHTML = '<p class="hint">本片无约束触发。</p>';
+}
+
+// Per-frame constraint state: residuals with priorities, plus viewport
+// emphasis on the exact joints involved. Updated on every pose change.
+function updateConstraintNow() {
+  const host = $('constraint-now');
+  const rep = state.retarget?.constraintReport;
+  if (!rep) {
+    setNowHtml(host, '<p class="hint">约束未启用，当前为初版无约束结果。</p>');
+    state.tgtViewer.setJointEmphasis(null);
+    state.tgtViewer.setMarkers([]);
+    return;
+  }
+  const fr = rep.perFrame[frameIndexAt(state.retarget, state.time)];
+  const emphasis = new Map();
+  const markers = [];
+  const rows = [];
+  for (const l of fr.limits) {
+    rows.push(`<div class="kv"><span>限制触发 ${l.joint} 轴${l.axisIndex}</span>`
+      + `<code class="hit">超出 ${deg(l.excessRad).toFixed(2)}°</code></div>`);
+    emphasis.set(l.joint, 0xe0b13e);
+  }
+  const settings = state.config.constraints.targets[state.tgt.name];
+  for (const c of fr.contacts) {
+    if (!c.active) {
+      // Inactive but still bleeding off a correction under the rate cap.
+      if (c.rateLimited) {
+        rows.push(`<div class="kv"><span>接触 ${c.id}（优先级 ${c.priority}）</span>`
+          + '<code class="ok">修正释放中 · 限速中</code></div>');
+      }
+      continue;
+    }
+    const spec = settings?.contacts.find((x) => x.id === c.id);
+    if (spec?.effector) emphasis.set(spec.effector, 0xff6b6b);
+    if (c.target) markers.push({ position: c.target, residual: c.residual });
+    const cls = c.residual > 1e-3 ? 'hit' : 'ok';
+    const extra = c.rateLimited ? ' · 限速中' : '';
+    rows.push(`<div class="kv"><span>接触 ${c.id}（优先级 ${c.priority}）</span>`
+      + `<code class="${cls}">残差 ${(c.residual * 1000).toFixed(1)}mm${extra}</code></div>`);
+  }
+  setNowHtml(host, rows.join('') || '<p class="hint">当前帧无约束触发。</p>');
+  state.tgtViewer.setJointEmphasis(emphasis);
+  state.tgtViewer.setMarkers(markers);
+}
+
+// Cache the per-frame status HTML: updatePose runs every animation frame.
+const _nowCache = { html: null };
+function setNowHtml(host, html) {
+  if (_nowCache.html === html) return;
+  _nowCache.html = html;
+  host.innerHTML = html;
+}
+
 // ---- validation -------------------------------------------------------------
 
 function runChecks() {
   const results = runAllChecks(sourceSkeleton, targetSkeleton, state.srcClip,
-    state.config.mapping, { policy: state.config.policy, rootGroundOffset: state.config.rootGroundOffset });
+    state.config.mapping, {
+      policy: state.config.policy,
+      rootGroundOffset: state.config.rootGroundOffset,
+      constraints: activeConstraintSettings(),
+    });
   const host = $('check-results');
   host.innerHTML = '';
   let allPass = true;
@@ -287,6 +531,8 @@ function syncUIFromConfig() {
   $('speed-val').textContent = `${c.playback.speed.toFixed(1)}×`;
   $('loop').checked = c.playback.loop;
   $('ghost').checked = c.ghostSource;
+  $('constraints-enabled').checked = !!c.constraints?.enabled;
+  $('constraints-body').hidden = !c.constraints?.enabled;
 }
 
 async function doExportGLB() {
@@ -370,6 +616,51 @@ function init() {
     buildRigs();
     selectTarget(t);
   });
+
+  // Constraints panel.
+  $('constraints-enabled').addEventListener('change', (e) => {
+    state.config.constraints.enabled = e.target.checked;
+    if (e.target.checked) ensureTargetConstraints();
+    rebuild();
+  });
+  $('btn-constraints-defaults').addEventListener('click', () => {
+    const defaults = defaultConstraintsFor(state.tgt.name);
+    state.config.constraints.targets[state.tgt.name] = defaults || {
+      limits: {}, contacts: [],
+      ik: { maxIterations: 16, tolerance: 1e-3, minImprovement: 1e-6, maxFrameStepDeg: 12 },
+    };
+    rebuild();
+  });
+  $('btn-add-limit').addEventListener('click', () => {
+    const settings = ensureTargetConstraints();
+    const joint = $('limit-joint').value;
+    const axis = $('limit-axis').value.split(',').map(Number);
+    if (!joint) return;
+    (settings.limits[joint] ??= []).push({ axis, min: -30, max: 30 });
+    rebuild();
+  });
+  $('btn-add-contact').addEventListener('click', () => {
+    const settings = ensureTargetConstraints();
+    const effector = $('contact-effector').value;
+    const mode = $('contact-mode').value;
+    if (!effector) return;
+    const id = `contact-${settings.contacts.length + 1}`;
+    settings.contacts.push(mode === 'point'
+      ? { id, effector, chain: [], priority: 20, mode, target: [0, 1, 0], enabled: true }
+      : {
+        id, effector, chain: [], priority: 10, mode,
+        groundY: 0.15, enter: 0.03, exit: 0.07, pin: false, enabled: true,
+      });
+    rebuild();
+  });
+  for (const [id, key] of [['ik-maxiter', 'maxIterations'], ['ik-tol', 'tolerance'], ['ik-maxstep', 'maxFrameStepDeg']]) {
+    $(id).addEventListener('change', (e) => {
+      const settings = ensureTargetConstraints();
+      settings.ik ??= {};
+      settings.ik[key] = Number(e.target.value) || 0;
+      rebuild();
+    });
+  }
 
   // Validation / config / export.
   $('btn-run-checks').addEventListener('click', runChecks);

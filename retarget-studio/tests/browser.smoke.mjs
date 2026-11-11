@@ -106,6 +106,37 @@ const skipFails = await page.$$eval('#check-results .check-item.fail', (els) => 
 await page.evaluate(() => { document.querySelector('input[name="policy"][value="compensate"]').click(); });
 if (skipFails !== 0) errors.push('skip policy produced failing checks');
 
+// 5b. Constraints panel: enable, tables/events populate, event click seeks,
+// and the validation suite stays green with constraints active.
+await page.evaluate(() => { document.getElementById('constraints-enabled').click(); });
+await new Promise((r) => setTimeout(r, 300));
+const cInfo = await page.evaluate(() => ({
+  bodyHidden: document.getElementById('constraints-body').hidden,
+  limitRows: document.querySelectorAll('#limits-table tbody tr').length,
+  contactRows: document.querySelectorAll('#contacts-table tbody tr').length,
+  events: document.querySelectorAll('#constraint-events .event-item').length,
+  stats: document.getElementById('constraint-stats').textContent,
+}));
+console.log('constraints:', JSON.stringify(cInfo));
+if (cInfo.bodyHidden || cInfo.limitRows < 10 || cInfo.contactRows < 2) {
+  errors.push('constraints panel not populated');
+}
+if (!cInfo.stats.includes('限制触发')) errors.push('constraint stats missing');
+if (cInfo.events < 1) errors.push('no constraint trigger events listed');
+const seekOk = await page.evaluate(() => {
+  const ev = document.querySelector('#constraint-events .event-item');
+  if (!ev) return false;
+  ev.click();
+  return Number.isFinite(Number(document.getElementById('time-val').textContent));
+});
+if (!seekOk) errors.push('event click did not seek');
+await page.click('#btn-run-checks');
+await new Promise((r) => setTimeout(r, 400));
+const cFails = await page.$$eval('#check-results .check-item.fail', (els) => els.length);
+if (cFails !== 0) errors.push('checks fail with constraints enabled');
+await page.evaluate(() => { document.getElementById('constraints-enabled').click(); });
+await new Promise((r) => setTimeout(r, 200));
+
 // 6. Config save -> reload determinism, exercised through the parser in-page.
 const cfgRoundtrip = await page.evaluate(async () => {
   const mod = await import('./src/engine/config.js');

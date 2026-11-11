@@ -19,6 +19,7 @@
 
 import { loadSkeleton, canonicalRestPose, fk } from './skeleton.js';
 import { toCanonicalQuat, toCanonicalVec } from './frame.js';
+import { applyConstraints } from './constraints.js';
 import {
   qmul, qconj, qrot, qcanonical, qidentity, vadd, vscale,
   vsub, qdist, vdist, vlen, slerp, deg,
@@ -224,6 +225,16 @@ export function retargetClip(srcRaw, tgtRaw, clip, mapping, options = {}) {
   const outFrames = norm.map((frame) =>
     retargetFrame(info, frame, policy, rootGroundOffset));
 
+  // Optional constraint pass (ROM limits + contact correction). When
+  // options.constraints is null/undefined the output is exactly the initial
+  // unconstrained retarget. The source clip is never touched: correction
+  // rewrites only the freshly produced target keyframes.
+  let constraintReport = null;
+  if (options.constraints) {
+    constraintReport = applyConstraints(info.tgt, info.tgtRest, outFrames,
+      options.constraints, { loop: clip.loop });
+  }
+
   const seamReports = stitchSigns(info.tgt, outFrames);
 
   // Evaluate target FK for every output frame (canonical world space).
@@ -242,6 +253,7 @@ export function retargetClip(srcRaw, tgtRaw, clip, mapping, options = {}) {
     mappingRows: info.rows,
     frames: solved,
     seamReports,
+    constraintReport,
     duration: clip.duration,
     loop: clip.loop,
     _info: info,
